@@ -3,6 +3,9 @@ from nltk.corpus.reader.tagged import TaggedCorpusReader
 from resumes.models import ResumeScan
 from django.shortcuts import render, redirect
 from django.contrib import messages
+from django.http import HttpResponse, HttpResponseNotFound
+from django.core.files.storage import FileSystemStorage
+from django.template.loader import render_to_string
 from resume_scanner.config import proj_directory
 
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -25,6 +28,9 @@ from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
 from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFParser
 import docx2txt
+import pdfkit 
+from pyvirtualdisplay import Display
+import os
 
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -36,10 +42,11 @@ ps = PorterStemmer()
 stop_words = set(stopwords.words('english'))
 year = date.today().year
 
-with open(proj_directory+"/skills.json", "r") as read_file:
+with open(proj_directory+"/skill_dict.json", "r") as read_file:
     skills_case = json.load(read_file)
-    skills = list(set([skill.lower() for skill in skills_case]))
-    skills_case = list(set(skills_case))
+    hard_skills = list(set([skill for skill in skills_case['Hard Skill']]))
+    soft_skills = list(set([skill for skill in skills_case['Soft Skill']]))
+    certifications = list(set([skill for skill in skills_case['Certification']]))
 
 regex_phone = r"\d{3}[-\.\s]{0,3}\d{3}[-\.\s]??\d{4}|\(\d{3}\)[-\.\s]{0,3}\d{3}[-\.\s]{0,3}\d{4}"
 regex_linkedin = r"[a-z]{2,3}\.linkedin\.com\/.*|linkedin\.com\/.*"
@@ -63,85 +70,153 @@ score_options =  {
 }
 
 def index(request): 
-    if ('resume' in request.session) and ('term' in request.session) and ('id' in request.session):
+    if ('example' in request.session) and (request.session['example'] == 'true'):
+        try:
+            resume = request.session['resume']
+            hard_skills_table = build_skills_table(request.session['resume'], request.session['job'], hard_skills)
+            soft_skills_table = build_skills_table(request.session['resume'], request.session['job'], soft_skills)
+            certifications_table = build_skills_table(request.session['resume'], request.session['job'], certifications)
+            output = request.session['output']
+            context, output = context_builder(request.session['job'],resume,hard_skills_table,soft_skills_table,certifications_table,output)
+            context.update({'example_job':request.session['job']})
+            del request.session['example']
+            if ('email_submitted' in request.session):
+                context.update({'email_message':'Email successfully sumbitted. When your account is verified we will send you a gift card!'})
+                del request.session['email_submitted']
+            context['jobs'] = []
+            request.session['context'] = context
+        except Exception as e:
+            print(e)
+            context = None
+    elif ('resume' in request.session) and ('term' in request.session) and ('id' in request.session):
         try:
             resumescan = ResumeScan.objects.get(id = request.session['id'])
             resume = request.session['resume']
-            skills_table = build_skills_table(resumescan.resume, resumescan.job, skills_case)
+            hard_skills_table = build_skills_table(request.session['resume'], resumescan.job, hard_skills)
+            soft_skills_table = build_skills_table(request.session['resume'], resumescan.job, soft_skills)
+            certifications_table = build_skills_table(request.session['resume'], resumescan.job, certifications)
             output = resumescan.outputs
-            score_up = 0
-            for skill in skills_table:
-                if skill['difference'] == True:
-                    score_up = score_up+0.01
-            output['lem_skill_up'] = output['lem']+score_up
             for i in output.keys():
-                output[i] = str(round(output[i],4)*100)[0:5]
-            # ATS Block
-            if len(re.findall(regex_phone, resume)) == 1:
-                phone = ('We found '+re.findall(regex_phone, resume)[0]+' in your resume. Nice job!',True)
-            elif len(re.findall(regex_phone, resume)) > 1:
-                phone = ('Multiple phone numbers found',False)
-            else:
-                phone = ('No phone found',False)
-            if len(re.findall(regex_linkedin, resume)) == 1:
-                linkedin = ('We found '+re.findall(regex_linkedin, resume)[0]+' in your resume. Stellar!',True)
-            elif len(re.findall(regex_linkedin, resume)) > 1:
-                linkedin = ('Multiple linkedin links found',False)
-            else:
-                linkedin = ('No linkedin found',False)
-            if len(re.findall(regex_email, resume)) == 1:
-                email = ('We found '+re.findall(regex_email, resume)[0]+' in your resume. Awesome formatting!',True)
-            elif len(re.findall(regex_email, resume)) > 1:
-                email = ('Multiple emails found',False)
-            else:
-                email = ('No email found',False)
-            degree = degree_check(degree_map,resume,resumescan.job)
-            if degree[1]:
-                degree_message = 'We found '+degree[0]+' in your resume. Nice work!'
-            else:
-                degree_message = 'We could not find '+degree[0]+' in your resume'
-            if (len(resume.split(' '))>400) and (len(resume.split(' '))<600):
-                resume_length = ('Your resume is between 400 and 600 words',True)
-            elif len(resume.split(' '))<400:
-                resume_length = ('Your resume is less than 400 words. ('+str(len(resume.split(' ')))+' words)',False)
-            elif len(resume.split(' '))>600:
-                resume_length = ('Your resume is more than 600 words. ('+str(len(resume.split(' ')))+' words)',False)
-            years_exp = years_exp_check(resume,resumescan.job,regex_years,year)
-            if float(output['lem_skill_up']) > 100:
-                output['lem_skill_up'] = 100
-                output_exp = score_options['80']
-            if float(output['lem_skill_up']) > 80:
-                output_exp = score_options['80']
-            elif float(output['lem_skill_up']) > 60:
-                output_exp = score_options['60']
-            elif float(output['lem_skill_up']) > 40:
-                output_exp = score_options['40']
-            elif float(output['lem_skill_up']) > 20:
-                output_exp = score_options['20']
-            else:
-                output_exp = score_options['0']
-            context = {
-                'out':output, 
-                'explanation':output_exp,
-                'skills':sorted(skills_table, key = lambda i: (i['job'], i['resume']),reverse=True), 
-                'ats':{
-                    'phone':{'data':phone[0],'found':phone[1]},
-                    'linkedin':{'data':linkedin[0],'found':linkedin[1]}, 
-                    'email':{'data':email[0],'found':email[1]}, 
-                    'degree_match':{'data':degree_message,'found':degree[1]},
-                    'resume_length':{'data':resume_length[0],'found':resume_length[1]},
-                    'years_exp':{'data':years_exp[0],'found':years_exp[1]},
-                    },
-                'last_resume': resume,
-                }
+                if isinstance(output[i], str):
+                    output[i] = float(output[i])/100
+            context, output = context_builder(resumescan.job,resume,hard_skills_table,soft_skills_table,certifications_table,output)
+            resumescan.outputs = output
+            resumescan.save()
+            if ('email_submitted' in request.session):
+                context.update({'email_message':'Email successfully sumbitted. When your account is verified we will send you a gift card!'})
+                del request.session['email_submitted']
+            request.session['context'] = context
         except Exception as e:
+            print(e)
             context = None
     else:
         context = None
     return render(request,'index.html',context)
 
+def context_builder(job,resume,hard_skills_table,soft_skills_table,certifications_table,output):
+    score_up = 0
+    for skill in hard_skills_table:
+        if skill['difference'] == True:
+            score_up = score_up+0.01
+    for skill in soft_skills_table:
+        if skill['difference'] == True:
+            score_up = score_up+0.01
+    for skill in certifications_table:
+        if skill['difference'] == True:
+            score_up = score_up+0.01
+    output['lem_skill_up'] = float(output['lem'])+score_up
+    for i in output.keys():
+        output[i] = str(round(float(output[i]),4)*100)[0:5]
+    # ATS Block
+    if len(re.findall(regex_phone, resume)) == 1:
+        phone = ('We found '+re.findall(regex_phone, resume)[0]+' in your resume. Nice job!',True)
+    elif len(re.findall(regex_phone, resume)) > 1:
+        phone = ('Multiple phone numbers found',False)
+    else:
+        phone = ('No phone found',False)
+    if len(re.findall(regex_linkedin, resume)) == 1:
+        linkedin = ('We found '+re.findall(regex_linkedin, resume)[0]+' in your resume. Stellar!',True)
+    elif len(re.findall(regex_linkedin, resume)) > 1:
+        linkedin = ('Multiple linkedin links found',False)
+    else:
+        linkedin = ('No linkedin found',False)
+    if len(re.findall(regex_email, resume)) == 1:
+        email = ('We found '+re.findall(regex_email, resume)[0]+' in your resume. Awesome formatting!',True)
+    elif len(re.findall(regex_email, resume)) > 1:
+        email = ('Multiple emails found',False)
+    else:
+        email = ('No email found',False)
+    degree = degree_check(degree_map,resume,job)
+    if degree[1]:
+        degree_message = 'We found '+degree[0]+' in your resume. Nice work!'
+    else:
+        degree_message = 'We could not find '+degree[0]+' in your resume'
+    if (len(resume.split(' '))>=400) and (len(resume.split(' '))<=600):
+        resume_length = ('Your resume is between 400 and 600 words',True)
+    elif len(resume.split(' '))<400:
+        resume_length = ('Your resume is less than 400 words. ('+str(len(resume.split(' ')))+' words)',False)
+    elif len(resume.split(' '))>600:
+        resume_length = ('Your resume is more than 600 words. ('+str(len(resume.split(' ')))+' words)',False)
+    years_exp = years_exp_check(resume,job,regex_years,year)
+    if float(output['lem_skill_up']) > 100:
+        output['lem_skill_up'] = 100
+        output_exp = score_options['80']
+    if float(output['lem_skill_up']) > 80:
+        output_exp = score_options['80']
+    elif float(output['lem_skill_up']) > 60:
+        output_exp = score_options['60']
+    elif float(output['lem_skill_up']) > 40:
+        output_exp = score_options['40']
+    elif float(output['lem_skill_up']) > 20:
+        output_exp = score_options['20']
+    else:
+        output_exp = score_options['0']
+    
+    context = {
+        'out':output, 
+                'out':output, 
+        'out':output, 
+                'out':output, 
+        'out':output, 
+        'explanation':output_exp,
+        'hard_skills':sorted(hard_skills_table, key = lambda i: (i['job'], i['resume']),reverse=True), 
+        'soft_skills':sorted(soft_skills_table, key = lambda i: (i['job'], i['resume']),reverse=True), 
+        'certifications':sorted(certifications_table, key = lambda i: (i['job'], i['resume']),reverse=True), 
+        'ats':{
+            'phone':{'data':phone[0],'found':phone[1]},
+            'linkedin':{'data':linkedin[0],'found':linkedin[1]}, 
+                    'linkedin':{'data':linkedin[0],'found':linkedin[1]}, 
+            'linkedin':{'data':linkedin[0],'found':linkedin[1]}, 
+            'email':{'data':email[0],'found':email[1]}, 
+                    'email':{'data':email[0],'found':email[1]}, 
+            'email':{'data':email[0],'found':email[1]}, 
+            'degree_match':{'data':degree_message,'found':degree[1]},
+            'resume_length':{'data':resume_length[0],'found':resume_length[1]},
+            'years_exp':{'data':years_exp[0],'found':years_exp[1]},
+            },
+        'last_resume': resume,
+        }
+    return context, output
+
 def scan(request): 
-    if ((term_check(request) == False) or ((len(request.POST['resume']) < 1) and ('filename' not in request.FILES)) or (len(request.POST['jobpost']) < 1)):
+    if request.POST['example'] == 'true':
+        output = {}
+        try:
+            vectorizer = TfidfVectorizer(analyzer=ngram_lem, min_df = 0.1) 
+            tf_idf_matrix = vectorizer.fit_transform([request.POST['jobpost']])
+            indexs, scores = match_full_data(request.POST['resume'], vectorizer, tf_idf_matrix)
+            output.update({'lem':scores[0]})
+        except:
+            output.update({'lem':0})
+
+        post_resume = request.POST['resume']
+        request.session['resume'] = str(post_resume)
+        request.session['job'] = str(request.POST['jobpost'])
+        request.session['output'] = output
+        request.session['example'] = 'true'
+        return redirect('/resumescanner/')
+
+    elif ((term_check(request) == False) or ((len(request.POST['resume']) < 1) and ('filename' not in request.FILES)) or (len(request.POST['jobpost']) < 1)):
         messages.error(request, 'Please fill out resume, job post, and terms of service')
         return redirect('/resumescanner/')
     elif 'filename' in request.FILES:
@@ -193,7 +268,7 @@ def ngram_lem(text):
     text = re.sub(' +',' ',text).strip() # get rid of multiple spaces and replace with a single
     text = ' '+ text +' ' # pad names for ngrams...
     text = ' '.join([x for x in text.split(' ') if len(x)<15])
-    text = ' '.join([x for x in text.split(' ') if one_letter_tokens(skills,x)])
+    text = ' '.join([x for x in text.split(' ') if one_letter_tokens(hard_skills,x)])
     text = ' '.join([x for x in text.split(' ') if x not in stop_words])
     return [lemmatizer.lemmatize(x) for x in text.split(' ')]
 
@@ -314,6 +389,16 @@ def short_skill_checker(str_j_r, skill):
     elif '\n'+skill+',' in str_j_r:
         return True
     elif '\t'+skill+',' in str_j_r:
+        return True
+    elif ' '+skill+'\n' in str_j_r:
+        return True
+    elif ' '+skill+'\t' in str_j_r:
+        return True
+    elif skill+' ' in str_j_r:
+        return True
+    elif skill+'\n' in str_j_r:
+        return True
+    elif skill+'\t' in str_j_r:
         return True
     else:
         return False
